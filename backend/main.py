@@ -33,7 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global settings
+# Default settings
 def _default_config_path():
     """Resolve config path relative to this file so it works regardless of cwd. backend -> ... -> SelfCom/config/semantic-kitti.yaml"""
     _cur = os.path.dirname(os.path.abspath(__file__))
@@ -43,14 +43,13 @@ def _default_config_path():
         return _path
     return "/mnt/drtraining/user/songqikong/code_repos/SelfCom/config/semantic-kitti.yaml"
 
-class AppSettings:
-    def __init__(self):
-        self.base_dir = "/mnt/drtraining/user/songqikong/tep/se/seq/processed_data"
-        self.output_base_dir = "/mnt/drtraining/user/songqikong/code_repos/SelfCom/data"
-        self.config_path = _default_config_path()
-        self.dataset_type = "semantic_kitti"  # "semantic_kitti" | "semanticposs"
-
-app_settings = AppSettings()
+def _default_settings():
+    return {
+        "base_dir": "/mnt/drtraining/user/songqikong/tep/se/seq/processed_data",
+        "output_base_dir": "/mnt/drtraining/user/songqikong/code_repos/SelfCom/data",
+        "config_path": _default_config_path(),
+        "dataset_type": "semantic_kitti",
+    }
 
 # SQLite database for visualization data (replaces file-based vis storage)
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visualizations.db")
@@ -80,6 +79,36 @@ def init_db():
                 point_cloud TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                base_dir TEXT NOT NULL,
+                output_base_dir TEXT NOT NULL,
+                config_path TEXT NOT NULL,
+                dataset_type TEXT NOT NULL
+            )
+        """)
+
+def load_settings() -> Dict:
+    """Load settings from database, return defaults if not exist."""
+    with get_db() as conn:
+        row = conn.execute("SELECT base_dir, output_base_dir, config_path, dataset_type FROM settings WHERE id = 1").fetchone()
+    if row:
+        return {
+            "base_dir": row["base_dir"],
+            "output_base_dir": row["output_base_dir"],
+            "config_path": row["config_path"],
+            "dataset_type": row["dataset_type"],
+        }
+    return _default_settings()
+
+def save_settings(settings: Dict):
+    """Save settings to database."""
+    with get_db() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO settings (id, base_dir, output_base_dir, config_path, dataset_type)
+            VALUES (1, ?, ?, ?, ?)
+        """, (settings["base_dir"], settings["output_base_dir"], settings["config_path"], settings["dataset_type"]))
 
 def save_visualization(file_path: str, label: str, config: Dict, pseudo_bev: list, bev_after_voronoi: list, bev_after_conv: list, point_cloud: list) -> int:
     with get_db() as conn:
@@ -156,36 +185,35 @@ async def startup_event():
 
 @app.get("/api/settings")
 async def get_settings():
-    return {
-        "base_dir": app_settings.base_dir,
-        "output_base_dir": app_settings.output_base_dir,
-        "config_path": app_settings.config_path,
-        "dataset_type": app_settings.dataset_type,
-    }
+    return load_settings()
 
 @app.post("/api/settings")
 async def update_settings(settings: SettingsUpdate):
-    app_settings.base_dir = settings.base_dir
-    app_settings.output_base_dir = settings.output_base_dir
+    current = load_settings()
+    current["base_dir"] = settings.base_dir
+    current["output_base_dir"] = settings.output_base_dir
     if hasattr(settings, "dataset_type") and settings.dataset_type in ("semantic_kitti", "semanticposs"):
-        app_settings.dataset_type = settings.dataset_type
-    if getattr(settings, "config_path", None) and os.path.exists(settings.config_path) and settings.config_path != app_settings.config_path:
-        app_settings.config_path = settings.config_path
+        current["dataset_type"] = settings.dataset_type
+    if getattr(settings, "config_path", None):
+        current["config_path"] = settings.config_path
+    save_settings(current)
     return {"status": "success"}
 
 def _semanticposs_seq_root():
     """SemanticPOSS 序列根目录：若 base_dir 已以 /sequences 结尾则直接用，否则 base_dir/sequences。"""
-    base_dir = app_settings.base_dir.rstrip("/")
+    settings = load_settings()
+    base_dir = settings["base_dir"].rstrip("/")
     if base_dir.endswith("sequences"):
         return base_dir
     return os.path.join(base_dir, "sequences")
 
 @app.get("/api/sequences")
 async def get_sequences():
-    base_dir = app_settings.base_dir
+    settings = load_settings()
+    base_dir = settings["base_dir"]
     if not os.path.exists(base_dir):
         return {"sequences": []}
-    if app_settings.dataset_type == "semanticposs":
+    if settings["dataset_type"] == "semanticposs":
         seq_root = _semanticposs_seq_root()
         if not os.path.isdir(seq_root):
             return {"sequences": []}
@@ -196,8 +224,9 @@ async def get_sequences():
 
 @app.get("/api/sequences/{seq_id}/files")
 async def get_files(seq_id: str):
-    base_dir = app_settings.base_dir.rstrip("/")
-    if app_settings.dataset_type == "semanticposs":
+    settings = load_settings()
+    base_dir = settings["base_dir"].rstrip("/")
+    if settings["dataset_type"] == "semanticposs":
         seq_root = _semanticposs_seq_root()
         velo_dir = os.path.join(seq_root, seq_id, "velodyne")
         if not os.path.isdir(velo_dir):
@@ -205,7 +234,7 @@ async def get_files(seq_id: str):
         files = [f for f in os.listdir(velo_dir) if f.endswith(".bin")]
         files = sorted(files)[:100]
         return {"files": files, "dir": velo_dir}
-    seq_dir = os.path.join(app_settings.base_dir, seq_id)
+    seq_dir = os.path.join(settings["base_dir"], seq_id)
     if not os.path.exists(seq_dir):
         raise HTTPException(status_code=404, detail="Sequence not found")
     files = [f for f in os.listdir(seq_dir) if f.endswith(".ply") or f.endswith(".bin")]
@@ -251,6 +280,7 @@ def extract_point_cloud(voxel_grid):
 
 def _output_paths(file_path: str, dataset_type: str):
     """Return (output_path, vis_path) for the given file and dataset type."""
+    settings = load_settings()
     parts = file_path.replace("\\", "/").split("/")
     item = parts[-1]
     base_name = os.path.splitext(item)[0]
@@ -262,8 +292,8 @@ def _output_paths(file_path: str, dataset_type: str):
             if p == "velodyne" and i > 0:
                 seq = parts[i - 1]
                 break
-    output_dir = os.path.join(app_settings.output_base_dir, seq)
-    v_dir = os.path.join(app_settings.output_base_dir, "bev_vis", seq)
+    output_dir = os.path.join(settings["output_base_dir"], seq)
+    v_dir = os.path.join(settings["output_base_dir"], "bev_vis", seq)
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(v_dir, exist_ok=True)
     return os.path.join(output_dir, base_name + ".label"), os.path.join(v_dir, base_name + ".png")
@@ -271,7 +301,8 @@ def _output_paths(file_path: str, dataset_type: str):
 
 @app.post("/api/process")
 async def process_file(request: ProcessRequest):
-    if app_settings.dataset_type == "semanticposs" and request.file_path.rstrip("/").endswith(".ply"):
+    settings = load_settings()
+    if settings["dataset_type"] == "semanticposs" and request.file_path.rstrip("/").endswith(".ply"):
         raise HTTPException(
             status_code=400,
             detail="SemanticPOSS uses .bin point clouds, not .ply. Switch to SemanticPOSS dataset and reselect a .bin file.",
@@ -282,14 +313,14 @@ async def process_file(request: ProcessRequest):
     try:
         output_path, vis_path = (None, None)
         if request.save_output:
-            output_path, vis_path = _output_paths(request.file_path, app_settings.dataset_type)
+            output_path, vis_path = _output_paths(request.file_path, settings["dataset_type"])
 
         config_dict = request.config.model_dump() if hasattr(request.config, "model_dump") else request.config.dict()
         result = unified_process_one(
             request.file_path,
-            app_settings.dataset_type,
+            settings["dataset_type"],
             config_dict,
-            config_path=app_settings.config_path,
+            config_path=settings["config_path"],
             output_path=output_path,
             vis_path=vis_path,
         )

@@ -22,6 +22,15 @@ def init_db():
             point_cloud TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            base_dir TEXT NOT NULL,
+            output_base_dir TEXT NOT NULL,
+            config_path TEXT NOT NULL,
+            dataset_type TEXT NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
     print(f"数据库已创建: {DB_PATH}")
